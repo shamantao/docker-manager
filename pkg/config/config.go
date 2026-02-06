@@ -23,7 +23,32 @@ type ProjectConfig struct {
 
 // Config contient la configuration globale
 type Config struct {
-	Projects map[string]ProjectConfig `yaml:"projects"`
+	Root     string                     `yaml:"root,omitempty"`
+	Projects map[string]ProjectConfig   `yaml:"projects"`
+}
+
+// EnsureDefaultConfig crée le fichier de config par défaut s'il n'existe pas
+func EnsureDefaultConfig() error {
+	configDir := filepath.Join(os.Getenv("HOME"), ".docker-manager")
+	configPath := filepath.Join(configDir, "projects.yml")
+
+	// Si le fichier existe déjà, ne rien faire
+	if _, err := os.Stat(configPath); err == nil {
+		return nil
+	}
+
+	// Créer le répertoire s'il n'existe pas
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		return fmt.Errorf("erreur lors de la création du répertoire: %w", err)
+	}
+
+	// Créer un fichier de config par défaut
+	defaultConfig := &Config{
+		Root:     filepath.Join(os.Getenv("HOME"), "docker"),
+		Projects: make(map[string]ProjectConfig),
+	}
+
+	return SaveConfig(defaultConfig)
 }
 
 // LoadConfig charge la configuration depuis le fichier YAML

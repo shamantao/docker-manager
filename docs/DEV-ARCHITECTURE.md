@@ -63,7 +63,13 @@ func DiscoverInDefaultPath() ([]project.Project, error)
 // A project is a folder that starts with "docker-" and contains docker-compose.yml
 ```
 
-The default root is based on `$HOME` and can be changed later via config.
+**Configuration priority:**
+
+1. `DOCKER_MANAGER_ROOT` environment variable (highest priority)
+2. `root` field in `~/.docker-manager/projects.yml`
+3. Default: `$HOME/docker`
+
+At first launch, Docker Manager creates a default config file with `root: $HOME/docker`.
 
 ### 3) pkg/docker
 
@@ -80,9 +86,19 @@ All actions are delegated to Docker CLI / Docker Compose for compatibility.
 
 ### 4) pkg/config
 
-Optional YAML config:
+YAML config file at `~/.docker-manager/projects.yml`.
+
+**Auto-initialization**: On first launch, `config.EnsureDefaultConfig()` creates:
 
 ```yaml
+root: /home/user/docker
+projects: {}
+```
+
+Users can then customize:
+
+```yaml
+root: /custom/path
 projects:
   example:
     path: ./docker-example
@@ -90,6 +106,8 @@ projects:
       - name: web
         health_check: "curl -f http://localhost"
 ```
+
+The `root` field is used by discovery if `DOCKER_MANAGER_ROOT` is not set.
 
 ### 5) pkg/tui
 

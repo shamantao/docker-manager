@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/log"
 
+	"github.com/phil/docker-manager/pkg/config"
 	"github.com/phil/docker-manager/pkg/discovery"
 	"github.com/phil/docker-manager/pkg/docker"
 	"github.com/phil/docker-manager/pkg/project"
@@ -18,6 +19,11 @@ import (
 var logger = log.New(os.Stderr)
 
 func main() {
+	// Initialiser le fichier de config par défaut si nécessaire
+	if err := config.EnsureDefaultConfig(); err != nil {
+		logger.Warn("Impossible de créer le fichier de config par défaut", "error", err)
+	}
+
 	if len(os.Args) < 2 {
 		printHelp()
 		handleStatus()

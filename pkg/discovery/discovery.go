@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/phil/docker-manager/pkg/config"
 	"github.com/phil/docker-manager/pkg/project"
 )
 
@@ -69,11 +70,29 @@ func (d *Discoverer) Discover() ([]project.Project, error) {
 
 // DiscoverInDefaultPath découvre les projets dans le chemin Docker par défaut
 func DiscoverInDefaultPath() ([]project.Project, error) {
-	dockerDir := filepath.Join(os.Getenv("HOME"), "devwww", "docker")
-	if _, err := os.Stat(dockerDir); os.IsNotExist(err) {
-		return nil, fmt.Errorf("répertoire docker non trouvé: %s", dockerDir)
+	rootDir := os.Getenv("DOCKER_MANAGER_ROOT")
+	if rootDir == "" {
+		cfg, err := config.LoadConfig()
+		if err == nil && cfg.Root != "" {
+			rootDir = cfg.Root
+		}
+	}
+	if rootDir == "" {
+		rootDir = defaultRootDir()
 	}
 
-	discoverer := NewDiscoverer(dockerDir)
+	if _, err := os.Stat(rootDir); os.IsNotExist(err) {
+		return nil, fmt.Errorf("docker root directory not found: %s", rootDir)
+	}
+
+	discoverer := NewDiscoverer(rootDir)
 	return discoverer.Discover()
+}
+
+func defaultRootDir() string {
+	homeDir := os.Getenv("HOME")
+	if homeDir == "" {
+		return ""
+	}
+	return filepath.Join(homeDir, "docker")
 }

@@ -83,15 +83,42 @@ URLs:
 
 ## Configuration (optional)
 
-The optional config file lives at:
+At first launch, Docker Manager creates a default config file at:
 
 ```
 ~/.docker-manager/projects.yml
 ```
 
-Example:
+This file contains:
 
 ```yaml
+root: /home/yourname/docker
+projects: {}
+```
+
+### Changing the root directory
+
+**Option 1: Edit the config file** (recommended)
+
+```yaml
+root: /path/to/your/docker/projects
+```
+
+**Option 2: Environment variable** (temporary override)
+
+```bash
+export DOCKER_MANAGER_ROOT=/path/to/your/docker/projects
+docker-manager status
+```
+
+The environment variable takes precedence over the file.
+
+### Project-specific settings
+
+You can add health checks or custom settings per project:
+
+```yaml
+root: /home/yourname/docker
 projects:
   example:
     path: ./docker-example
