@@ -81,6 +81,25 @@ URLs:
   - open-webui => http://localhost:3000
 ```
 
+## Configuration (optional)
+
+The optional config file lives at:
+
+```
+~/.docker-manager/projects.yml
+```
+
+Example:
+
+```yaml
+projects:
+  example:
+    path: ./docker-example
+    services:
+      - name: web
+        health_check: "curl -f http://localhost"
+```
+
 ## Local development
 
 ```bash
@@ -93,11 +112,3 @@ make clean
 ## License
 
 MIT
-- [ ] Export des logs en JSON
-- [ ] Intégration avec les registries privées
-- [ ] Profils docker-compose
-- [ ] Multi-user support
-
----
-
-**Happy Docker managing! 🚀**
