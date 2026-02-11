@@ -335,9 +335,15 @@ func StartDockerDaemon() error {
 func StopDockerDaemon() error {
 	switch runtime.GOOS {
 	case "darwin":
-		// macOS: quit app Docker
-		cmd := exec.Command("osascript", "-e", "quit app \"Docker\"")
-		return cmd.Run()
+		// macOS: quit application Docker Desktop (syntaxe osascript correcte)
+		cmd := exec.Command("osascript", "-e", "quit application \"Docker Desktop\"")
+		err := cmd.Run()
+		if err != nil {
+			// Fallback: utiliser killall si osascript échoue
+			killCmd := exec.Command("killall", "Docker")
+			return killCmd.Run()
+		}
+		return nil
 	case "linux":
 		// Linux: systemctl stop docker
 		cmd := exec.Command("sudo", "systemctl", "stop", "docker")
