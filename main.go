@@ -103,6 +103,15 @@ func main() {
 			logger.Fatal(err)
 		}
 
+	case "daemon":
+		if len(os.Args) < 3 {
+			fmt.Println("usage: docker-manager daemon <start|stop|status>")
+			os.Exit(1)
+		}
+		if err := handleDaemon(os.Args[2]); err != nil {
+			logger.Fatal(err)
+		}
+
 	case "--version", "-v":
 		fmt.Println("Docker Manager v1.0.0")
 
@@ -129,6 +138,7 @@ Commands:
   status [project]         Affiche le statut (global ou d'un projet)
   logs <project> [service] Affiche les logs
                            Options: -f (follow en temps réel)
+  daemon <start|stop|status> Gère le daemon Docker
   dashboard                Lance le dashboard interactif
 
 Exemples:
@@ -138,6 +148,9 @@ Exemples:
   docker-manager status                    # Tous les projets
   docker-manager status pbwww              # Détail d'un projet
   docker-manager logs pbwww -f
+  docker-manager daemon status             # Check Docker daemon
+  docker-manager daemon start              # Démarrer Docker daemon
+  docker-manager daemon stop               # Arrêter Docker daemon
   docker-manager dashboard
 
 Options:
@@ -391,5 +404,50 @@ func handleDashboard() error {
 		return fmt.Errorf("erreur du dashboard: %w", err)
 	}
 
+	return nil
+}
+
+func handleDaemon(action string) error {
+	installed, _ := docker.CheckDockerInstallation()
+	if !installed {
+		fmt.Println("❌ Docker n'est pas installé")
+		fmt.Printf("📖 Téléchargez Docker: %s\n", docker.GetDockerInstallURL())
+		return nil
+	}
+
+	running, _ := docker.CheckDockerDaemonStatus()
+
+	switch action {
+	case "status":
+		if running {
+			fmt.Println("✅ Docker daemon est actif")
+		} else {
+			fmt.Println("⏹️  Docker daemon est arrêté")
+		}
+	case "start":
+		if running {
+			fmt.Println("ℹ️  Docker daemon est déjà en cours d'exécution")
+			return nil
+		}
+		fmt.Println("🚀 Démarrage de Docker daemon...")
+		if err := docker.StartDockerDaemon(); err != nil {
+			return fmt.Errorf("erreur au démarrage du daemon: %w", err)
+		}
+		fmt.Println("✅ Docker daemon a été démarré")
+	case "stop":
+		if !running {
+			fmt.Println("ℹ️  Docker daemon est déjà arrêté")
+			return nil
+		}
+		fmt.Println("🛑 Arrêt de Docker daemon...")
+		if err := docker.StopDockerDaemon(); err != nil {
+			return fmt.Errorf("erreur à l'arrêt du daemon: %w", err)
+		}
+		fmt.Println("✅ Docker daemon a été arrêté")
+	default:
+		fmt.Printf("Action inconnue: %s\n", action)
+		fmt.Println("Utilisez: start, stop, ou status")
+		return nil
+	}
 	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 
 	"github.com/phil/docker-manager/pkg/project"
@@ -281,9 +282,79 @@ func appendUnique(existing []string, values []string) []string {
 
 // EnsureDockerRunning vérifie que Docker est accessible
 func EnsureDockerRunning() error {
-	cmd := exec.Command("docker", "info")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("Docker n'est pas accessible. Assurez-vous que Docker Desktop est lancé")
+	installed, _ := CheckDockerInstallation()
+	if !installed {
+		return fmt.Errorf("❌ Docker n'est pas installé.\n📖 Visitez: https://www.docker.com/products/docker-desktop")
+	}
+
+	running, _ := CheckDockerDaemonStatus()
+	if !running {
+		return fmt.Errorf("⏹️  Docker daemon est arrêté.\nUsez: docker-manager daemon start")
 	}
 	return nil
+}
+
+// CheckDockerInstallation vérifie si Docker est installé
+func CheckDockerInstallation() (bool, error) {
+	cmd := exec.Command("docker", "--version")
+	err := cmd.Run()
+	return err == nil, nil
+}
+
+// CheckDockerDaemonStatus vérifie si le daemon Docker est actif
+func CheckDockerDaemonStatus() (bool, error) {
+	cmd := exec.Command("docker", "info")
+	err := cmd.Run()
+	return err == nil, nil
+}
+
+// StartDockerDaemon démarre Docker
+func StartDockerDaemon() error {
+	switch runtime.GOOS {
+	case "darwin":
+		// macOS: ouvrir Docker.app
+		cmd := exec.Command("open", "-a", "Docker")
+		return cmd.Run()
+	case "linux":
+		// Linux: systemctl start docker
+		cmd := exec.Command("sudo", "systemctl", "start", "docker")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+		return cmd.Run()
+	case "windows":
+		// Windows: PowerShell
+		cmd := exec.Command("powershell", "-Command", "Start-Process Docker")
+		return cmd.Run()
+	default:
+		return fmt.Errorf("système d'exploitation non supporté")
+	}
+}
+
+// StopDockerDaemon arrête Docker
+func StopDockerDaemon() error {
+	switch runtime.GOOS {
+	case "darwin":
+		// macOS: quit app Docker
+		cmd := exec.Command("osascript", "-e", "quit app \"Docker\"")
+		return cmd.Run()
+	case "linux":
+		// Linux: systemctl stop docker
+		cmd := exec.Command("sudo", "systemctl", "stop", "docker")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+		return cmd.Run()
+	case "windows":
+		// Windows: PowerShell
+		cmd := exec.Command("powershell", "-Command", "Stop-Process -Name Docker.exe")
+		return cmd.Run()
+	default:
+		return fmt.Errorf("système d'exploitation non supporté")
+	}
+}
+
+// GetDockerInstallURL retourne l'URL d'installation de Docker selon l'OS
+func GetDockerInstallURL() string {
+	return "https://www.docker.com/products/docker-desktop"
 }

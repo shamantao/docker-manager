@@ -8,6 +8,7 @@ A fast, practical Docker project manager with a CLI and a small TUI dashboard.
 - Fast CLI: start, stop, restart, status, logs
 - Detailed status for a single project (services + URLs)
 - Interactive TUI dashboard
+- Docker daemon management (start, stop, status)
 
 ## Requirements
 
@@ -45,6 +46,11 @@ docker-manager restart pbwww nginx
 # Logs (use -f for follow)
 docker-manager logs pbwww
 docker-manager logs pbwww nginx -f
+
+# Docker daemon management
+docker-manager daemon status         # Check daemon status
+docker-manager daemon start          # Start Docker daemon
+docker-manager daemon stop           # Stop Docker daemon
 ```
 
 ### Dashboard (TUI)
