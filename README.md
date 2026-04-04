@@ -2,12 +2,16 @@
 
 A fast, practical Docker project manager with a CLI and a small TUI dashboard.
 
+This README is the functional user guide.
+For internal code structure and implementation details, see [docs/DEV-ARCHITECTURE.md](docs/DEV-ARCHITECTURE.md).
+
 ## Features
 
-- Auto-discovery of `docker-*` projects
-- Fast CLI: start, stop, restart, status, logs
+- Auto-discovery of `docker-*` projects from configured roots
+- Fast CLI: add, remove, list, start, stop, restart, status, logs
 - Detailed status for a single project (services + URLs)
-- Interactive TUI dashboard
+- Interactive TUI dashboard with spinner + live operation logs
+- Detection of running containers outside config (shown as orphan entries)
 - Docker daemon management (start, stop, status)
 
 ## Requirements
@@ -30,6 +34,13 @@ This builds and installs `docker-manager` into `/usr/local/bin`.
 ```bash
 # Global status
 docker-manager status
+
+# Registered projects from config
+docker-manager list
+
+# Add/remove explicit project entries
+docker-manager add ~/kDrive/docker/docker-pbwww
+docker-manager remove pbwww
 
 # Detailed status for one project
 docker-manager status pbwww
@@ -66,9 +77,24 @@ Keys:
 - `R`: restart
 - `Q`: quit
 
+During long operations (image pull/build/up/down), the dashboard shows:
+- an animated spinner
+- live output lines from Docker Compose
+- final success/error status
+
+Orphan running containers (not managed by configured projects) are shown with a `👻` marker and can be stopped from the dashboard.
+
 ## Project discovery
 
-Docker Manager scans a single root directory and picks any folder that matches:
+Docker Manager can discover projects from roots and explicit config entries.
+
+Discovery order:
+1. `DOCKER_MANAGER_ROOT` environment variable (single root override)
+2. `roots` list in `~/.docker-manager/projects.yml`
+3. `root` in `~/.docker-manager/projects.yml` (backward compatibility)
+4. explicit `projects` entries added with `docker-manager add`
+
+Auto-discovered folders must match:
 
 - name starts with `docker-`
 - contains a `docker-compose.yml`
@@ -98,42 +124,49 @@ At first launch, Docker Manager creates a default config file at:
 This file contains:
 
 ```yaml
-root: /home/yourname/docker
+roots:
+  - /Users/you/kDrive/docker
 projects: {}
 ```
 
-### Changing the root directory
+### Discovery roots
 
-**Option 1: Edit the config file** (recommended)
+Edit `~/.docker-manager/projects.yml`:
 
 ```yaml
-root: /path/to/your/docker/projects
+roots:
+  - /path/to/docker/projects
+  - /another/path
 ```
 
-**Option 2: Environment variable** (temporary override)
+Temporary override from shell:
 
 ```bash
 export DOCKER_MANAGER_ROOT=/path/to/your/docker/projects
 docker-manager status
 ```
 
-The environment variable takes precedence over the file.
+`DOCKER_MANAGER_ROOT` overrides config roots for that command session.
 
-### Project-specific settings
+### Explicit project registration
 
-You can add health checks or custom settings per project:
+Register a specific compose directory directly:
 
-```yaml
-root: /home/yourname/docker
-projects:
-  example:
-    path: ./docker-example
-    services:
-      - name: web
-        health_check: "curl -f http://localhost"
+```bash
+docker-manager add /path/to/docker-myproject
+docker-manager remove myproject
 ```
 
+This writes entries under `projects:` in `~/.docker-manager/projects.yml`.
+
+### About `.env` interpolation
+
+If a project has a `.env` file with nested variable interpolation (for example `${BASE}/docker`), Docker Manager resolves it through bash before running Docker Compose.
+This supports setups where `.env` is a symlink to a shared secrets file.
+
 ## Local development
+
+Technical architecture and contributor notes live in [docs/DEV-ARCHITECTURE.md](docs/DEV-ARCHITECTURE.md).
 
 ```bash
 make build
@@ -141,6 +174,16 @@ make run
 make test
 make clean
 ```
+
+## Version
+
+Version is defined in a single source of truth in [main.go](main.go):
+
+```go
+const Version = "1.3.0"
+```
+
+Use `docker-manager --version` to display it.
 
 ## License
 

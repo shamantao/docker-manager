@@ -1,6 +1,15 @@
 # Docker Manager Architecture (Dev Guide)
 
 This document explains the code structure so contributors can extend the app.
+It is the technical companion to [README.md](../README.md), which stays focused on user-facing behavior, installation, and CLI/TUI usage.
+
+Scope of this document:
+- internal module layout
+- execution flow
+- technical decisions
+- extension points for contributors
+
+To avoid duplication, user workflows and end-user examples should stay in [README.md](../README.md).
 
 ## Project Layout
 
@@ -37,7 +46,7 @@ Example:
 2. projects := discovery.DiscoverInDefaultPath()
 3. find project by name
 4. mgr := docker.NewManager(project.Path)
-5. mgr.StartProject(&project)
+5. mgr.StartProjectStream(&project, outputChan)
 ```
 
 ## Modules
@@ -52,6 +61,7 @@ type Project struct {
     Services     []Service
     Running      bool
     ServiceCount int
+    Orphan       bool
 }
 ```
 
@@ -59,30 +69,40 @@ type Project struct {
 
 ```go
 func DiscoverInDefaultPath() ([]project.Project, error)
-// Scans a root folder and returns projects
-// A project is a folder that starts with "docker-" and contains docker-compose.yml
+// Combines:
+// 1) auto-discovery from configured roots
+// 2) explicit projects from config
 ```
 
 **Configuration priority:**
 
 1. `DOCKER_MANAGER_ROOT` environment variable (highest priority)
-2. `root` field in `~/.docker-manager/projects.yml`
-3. Default: `$HOME/docker`
+2. `roots` field in `~/.docker-manager/projects.yml`
+3. `root` field in `~/.docker-manager/projects.yml` (backward compatibility)
 
-At first launch, Docker Manager creates a default config file with `root: $HOME/docker`.
+Auto-discovered entries are deduplicated by project name.
+Explicit config entries override auto-discovered path when names collide.
 
 ### 3) pkg/docker
 
+Key APIs:
+
 ```go
-func (m *Manager) StartProject(p *project.Project) error
-func (m *Manager) StopProject(p *project.Project) error
-func (m *Manager) RestartService(p *project.Project, serviceName string) error
+func (m *Manager) StartProjectStream(p *project.Project, output chan<- string) error
+func (m *Manager) StopProjectStream(p *project.Project, output chan<- string) error
+func (m *Manager) RestartServiceStream(p *project.Project, output chan<- string, service string) error
+func (m *Manager) StopOrphanProjectStream(p *project.Project, output chan<- string) error
+func (m *Manager) DiscoverOrphanProjects(knownNames map[string]bool) ([]project.Project, error)
 func (m *Manager) GetStatus(p *project.Project) (bool, int, error)
 func (m *Manager) GetStatusDetailed(p *project.Project) (bool, int, string)
 func (m *Manager) GetServiceURLs(p *project.Project) (map[string][]string, error)
 ```
 
-All actions are delegated to Docker CLI / Docker Compose for compatibility.
+Implementation notes:
+- Compose is executed through CLI for compatibility.
+- If `.env` exists, commands are run through `bash` with `source .env`.
+- `--env-file /dev/null` prevents Compose from reparsing `.env` with limited interpolation support.
+- Streaming actions combine stdout/stderr and forward output lines to TUI/CLI.
 
 ### 4) pkg/config
 
@@ -91,37 +111,42 @@ YAML config file at `~/.docker-manager/projects.yml`.
 **Auto-initialization**: On first launch, `config.EnsureDefaultConfig()` creates:
 
 ```yaml
-root: /home/user/docker
 projects: {}
 ```
 
-Users can then customize:
+Supported fields:
 
 ```yaml
-root: /custom/path
+root: /legacy/single/root            # optional (backward compat)
+roots:                               # preferred
+    - /path/one
+    - /path/two
 projects:
   example:
-    path: ./docker-example
-    services:
-      - name: web
-        health_check: "curl -f http://localhost"
+        path: /abs/path/to/docker-example
 ```
-
-The `root` field is used by discovery if `DOCKER_MANAGER_ROOT` is not set.
 
 ### 5) pkg/tui
 
-Bubble Tea TUI model with a simple list + hotkeys.
+Bubble Tea model for dashboard interactions.
+
+Current behavior:
+- async start/stop/restart operations
+- spinner while operation is running
+- live output tail (`maxLogLines`) from Docker commands
+- key locking during running operations (except quit)
+- orphan project handling (shown with `Orphan=true`)
 
 ## Notes
 
 - Project names are normalized to lowercase for Docker Compose compatibility.
 - `status <project>` uses Docker labels to extract exposed ports and prints `http://localhost:<port>`.
+- `status` (global) appends an orphan section when running containers are outside configured projects.
 
 ---
 
 ### 6. `main.go`
-Point d'entrée et routage :
+Entrypoint and command routing:
 
 ```go
 func main()
@@ -130,13 +155,12 @@ func main()
     // Appelle le bon function handle*()
 
 func handleStart(projectName string)
-    // Orchestre la séquence
-    // 1. Check Docker
-    // 2. Découvre projets
-    // 3. Trouve le projet
-    // 4. Exécute l'action
+    // 1. check Docker daemon
+    // 2. discover projects
+    // 3. locate target project
+    // 4. run streamed action through docker.Manager
 
-// Même pattern pour handleStop, handleRestart, etc.
+// same orchestration pattern for stop/restart/status/logs/dashboard
 ```
 
 **À modifier si :**
@@ -146,104 +170,73 @@ func handleStart(projectName string)
 
 ---
 
-## 🔌 Dépendances externes
+## External dependencies
 
 ```go
 import (
-    "flag"                            // CLI basique
-    "os/exec"                         // Exécute docker-compose
-    
-    tea "github.com/charmbracelet/bubbletea"    // TUI
-    "github.com/charmbracelet/lipgloss"         // Formatting
-    "github.com/charmbracelet/log"              // Logging
-    
-    "gopkg.in/yaml.v3"                          // Config YAML
+    "flag"
+    "os/exec"
+
+    tea "github.com/charmbracelet/bubbletea"
+    "github.com/charmbracelet/bubbles/spinner"
+    "github.com/charmbracelet/lipgloss"
+    "github.com/charmbracelet/log"
+
+    "gopkg.in/yaml.v3"
 )
 ```
 
-Toutes ces librairies sont lightweight et n'ont pas de dépendances runtime. L'exécutable est standalone ! 🎯
+These dependencies are compile-time/runtime inside the binary; deployment remains a single executable.
 
 ---
 
-## 🚀 Comment ajouter une fonctionnalité
+## How to add a command
 
-### Exemple: Ajouter un commande `export` (backup docker-compose)
+Minimal checklist:
+- add a `case` in `main()` command switch
+- add `handleXxx(...)` orchestration in `main.go`
+- add manager method(s) in `pkg/docker` if Docker actions are needed
+- update help output in `printHelp()`
+- update [README.md](../README.md) for functional behavior
+- update this file only for technical changes
 
-**1. Ajouter dans main.go :**
-```go
-case "export":
-    if len(os.Args) < 3 {
-        fmt.Println("usage: docker-manager export <project> <output-file>")
-        os.Exit(1)
-    }
-    if err := handleExport(os.Args[2], os.Args[3]); err != nil {
-        logger.Fatal(err)
-    }
-```
+## Logs and debugging
 
-**2. Implémenter en bas de main.go :**
-```go
-func handleExport(projectName string, outputFile string) error {
-    projects, err := discovery.DiscoverInDefaultPath()
-    // ... trouver le projet ...
-    
-    // Lire le docker-compose.yml
-    data, err := os.ReadFile(filepath.Join(p.Path, "docker-compose.yml"))
-    
-    // Écrire dans le fichier cible
-    return os.WriteFile(outputFile, data, 0644)
-}
-```
-
-**3. Ajouter à l'aide (dans printHelp()) :**
-```go
-export <project> <file>  Exporte la config docker-compose
-```
-
-C'est simple ! La structure est prête pour ça. 💪
-
----
-
-## 📈 Logs & Debugging
-
-Le code utilise :
+Logging backend:
 ```go
 logger := log.New(os.Stderr)  // charmbracelet/log
-logger.Fatal(err)   // Arrête avec une erreur
+logger.Fatal(err)
 ```
 
-Pour déboguer :
+Quick debug loop:
 ```bash
-# Ajoute du debugging dans le code
+# add debug points
 logger.Debug("Ma variable:", myVar)
 
-# Compile et exécute
+# compile and run
 make build
 ./docker-manager start pbwww
 ```
 
 ---
 
-## 🧪 Tester les changements
+## Test and validation
 
 ```bash
-# 1. Modifie le code
-vim pkg/docker/docker.go
-
-# 2. Recompile
+# rebuild
 make build
 
-# 3. Test local
+# local check
 ./docker-manager status
 
-# 4. Test depuis partout (après make install)
+# install global binary
 make install
 docker-manager status
 ```
 
 ---
 
-## 🎯 Architecture Decisions
+## Architecture decisions
 
 ### Pourquoi pas d'API Docker SDK ?
 - ✅ Plus simple d'utiliser le CLI docker-compose
@@ -258,14 +251,13 @@ docker-manager status
 - ✅ Cross-plateforme facile
 
 ### Pourquoi Bubble Tea pour TUI ?
-- ✅ Beautiful, modern interface
-- ✅ Bien maintenu par Charm
-- ✅ Pas trop complexe
-- ❌ Pas de widgets complexes (mais on n'en a pas besoin)
+- ✅ simple async event model for terminal UI
+- ✅ mature ecosystem (spinner, styling)
+- ✅ easy integration with streamed command output
 
 ---
 
-## 🔮 Idées d'amélioration
+## Improvement ideas
 
 1. **Health Checks**
    ```bash
@@ -295,16 +287,7 @@ docker-manager status
 
 ---
 
-## 📞 Support pour modifications
+## Maintainer note
 
-Si tu veux ajouter quelque chose :
-1. Identifie le module (discovery, docker, tui, etc.)
-2. Regarde l'interface/signature existante
-3. Ajoute ta fonction
-4. Test avec `make build`
-
-La structure est prête pour ça ! 🚀
-
----
-
-**Bon dev ! 💻**
+When behavior is user-visible, document it in [README.md](../README.md).
+When behavior is implementation-specific, document it here.
