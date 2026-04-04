@@ -68,27 +68,72 @@ func (d *Discoverer) Discover() ([]project.Project, error) {
 	return projects, nil
 }
 
-// DiscoverInDefaultPath découvre les projets dans le chemin Docker par défaut
+// DiscoverInDefaultPath découvre tous les projets : auto-scan des racines + projets explicites
 func DiscoverInDefaultPath() ([]project.Project, error) {
-	rootDir := os.Getenv("DOCKER_MANAGER_ROOT")
-	if rootDir == "" {
-		cfg, err := config.LoadConfig()
-		if err == nil && cfg.Root != "" {
-			rootDir = cfg.Root
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		cfg = &config.Config{Projects: make(map[string]config.ProjectConfig)}
+	}
+
+	var projects []project.Project
+	seen := make(map[string]bool)
+
+	// 1. Auto-découverte depuis les racines configurées (env > roots[] > root)
+	for _, rootDir := range resolveRoots(cfg) {
+		if _, err := os.Stat(rootDir); os.IsNotExist(err) {
+			continue // dossier configuré mais absent → on ignore sans erreur
+		}
+		d := NewDiscoverer(rootDir)
+		found, _ := d.Discover()
+		for _, p := range found {
+			if !seen[p.Name] {
+				projects = append(projects, p)
+				seen[p.Name] = true
+			}
 		}
 	}
-	if rootDir == "" {
-		rootDir = defaultRootDir()
+
+	// 2. Projets enregistrés explicitement via "docker-manager add"
+	// Un projet explicite remplace l'entrée auto-découverte si même nom
+	for name, pcfg := range cfg.Projects {
+		composePath := filepath.Join(pcfg.Path, "docker-compose.yml")
+		if seen[name] {
+			for i := range projects {
+				if projects[i].Name == name {
+					projects[i].Path = pcfg.Path
+					projects[i].ComposePath = composePath
+					break
+				}
+			}
+		} else {
+			projects = append(projects, project.Project{
+				Name:        name,
+				Path:        pcfg.Path,
+				ComposePath: composePath,
+				Services:    []project.Service{},
+			})
+			seen[name] = true
+		}
 	}
 
-	if _, err := os.Stat(rootDir); os.IsNotExist(err) {
-		return nil, fmt.Errorf("docker root directory not found: %s", rootDir)
-	}
-
-	discoverer := NewDiscoverer(rootDir)
-	return discoverer.Discover()
+	return projects, nil
 }
 
+// resolveRoots retourne la liste ordonnée des dossiers racines à scanner
+func resolveRoots(cfg *config.Config) []string {
+	if envRoot := os.Getenv("DOCKER_MANAGER_ROOT"); envRoot != "" {
+		return []string{envRoot}
+	}
+	if len(cfg.Roots) > 0 {
+		return cfg.Roots
+	}
+	if cfg.Root != "" {
+		return []string{cfg.Root}
+	}
+	return nil
+}
+
+// defaultRootDir est conservé pour compatibilité éventuelle
 func defaultRootDir() string {
 	homeDir := os.Getenv("HOME")
 	if homeDir == "" {

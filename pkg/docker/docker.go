@@ -1,9 +1,12 @@
 package docker
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -22,61 +25,154 @@ func NewManager(workDir string) *Manager {
 	}
 }
 
-// StartProject démarre un projet avec build
-func (m *Manager) StartProject(p *project.Project) error {
-	fmt.Printf("🔨 Construction de l'image %s...\n", p.Name)
-	cmd := exec.Command("docker-compose", "-f", "docker-compose.yml", "-p", p.Name, "build")
-	cmd.Dir = p.Path
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+// runCompose exécute une commande docker-compose dans le répertoire du projet.
+// Si un fichier .env existe, il est sourcé via bash pour résoudre l'interpolation de variables.
+// Stdout et stderr sont capturés pour pouvoir afficher les erreurs dans le TUI.
+func (m *Manager) runCompose(p *project.Project, args ...string) (string, error) {
+	envFile := filepath.Join(p.Path, ".env")
 
-	if err := cmd.Run(); err != nil {
+	var cmd *exec.Cmd
+	composeArgs := append([]string{"-f", "docker-compose.yml", "-p", p.Name}, args...)
+
+	if _, err := os.Stat(envFile); err == nil {
+		// .env existe → passer par bash pour résoudre l'interpolation
+		// --env-file /dev/null empêche docker-compose de relire .env avec son
+		// propre parser (qui ne supporte pas l'interpolation bash)
+		composeArgs = append([]string{"--env-file", "/dev/null"}, composeArgs...)
+		shellCmd := "set -a && source .env && set +a && docker-compose " + shelljoin(composeArgs)
+		cmd = exec.Command("bash", "-c", shellCmd)
+	} else {
+		cmd = exec.Command("docker-compose", composeArgs...)
+	}
+	cmd.Dir = p.Path
+
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		errDetail := strings.TrimSpace(stderr.String())
+		if errDetail == "" {
+			errDetail = err.Error()
+		}
+		return stdout.String(), fmt.Errorf("%s", errDetail)
+	}
+	return stdout.String(), nil
+}
+
+// shelljoin concatène des arguments en les échappant pour le shell
+func shelljoin(args []string) string {
+	escaped := make([]string, len(args))
+	for i, a := range args {
+		escaped[i] = "'" + strings.ReplaceAll(a, "'", "'\"'\"'") + "'"
+	}
+	return strings.Join(escaped, " ")
+}
+
+// runComposeStream lance docker-compose et envoie les lignes de sortie dans un channel.
+// Le channel est fermé quand la commande se termine.
+// Retourne une erreur si la commande échoue.
+func (m *Manager) runComposeStream(p *project.Project, output chan<- string, args ...string) error {
+	envFile := filepath.Join(p.Path, ".env")
+
+	var cmd *exec.Cmd
+	composeArgs := append([]string{"-f", "docker-compose.yml", "-p", p.Name}, args...)
+
+	if _, err := os.Stat(envFile); err == nil {
+		composeArgs = append([]string{"--env-file", "/dev/null"}, composeArgs...)
+		shellCmd := "set -a && source .env && set +a && docker-compose " + shelljoin(composeArgs)
+		cmd = exec.Command("bash", "-c", shellCmd)
+	} else {
+		cmd = exec.Command("docker-compose", composeArgs...)
+	}
+	cmd.Dir = p.Path
+
+	// Combiner stdout+stderr dans un seul pipe
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	if err := cmd.Start(); err != nil {
+		pw.Close()
+		return err
+	}
+
+	// Lire les lignes en streaming
+	go func() {
+		scanner := bufio.NewScanner(pr)
+		for scanner.Scan() {
+			output <- scanner.Text()
+		}
+	}()
+
+	err := cmd.Wait()
+	pw.Close()
+	return err
+}
+
+// StartProjectStream démarre un projet avec build, en streamant la sortie
+func (m *Manager) StartProjectStream(p *project.Project, output chan<- string) error {
+	output <- "🔨 Construction de l'image..."
+	if err := m.runComposeStream(p, output, "build"); err != nil {
 		return fmt.Errorf("erreur lors de la construction: %w", err)
 	}
 
-	fmt.Printf("🚀 Démarrage du projet %s...\n", p.Name)
-	cmd = exec.Command("docker-compose", "-f", "docker-compose.yml", "-p", p.Name, "up", "-d")
-	cmd.Dir = p.Path
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
+	output <- "🚀 Démarrage des containers..."
+	if err := m.runComposeStream(p, output, "up", "-d"); err != nil {
 		return fmt.Errorf("erreur lors du démarrage: %w", err)
 	}
 
-	fmt.Printf("✅ Projet %s démarré avec succès\n", p.Name)
 	return nil
 }
 
-// StopProject arrête et supprime les containers
-func (m *Manager) StopProject(p *project.Project) error {
-	fmt.Printf("🛑 Arrêt du projet %s...\n", p.Name)
-	cmd := exec.Command("docker-compose", "-f", "docker-compose.yml", "-p", p.Name, "down")
-	cmd.Dir = p.Path
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
+// StopProjectStream arrête un projet en streamant la sortie
+func (m *Manager) StopProjectStream(p *project.Project, output chan<- string) error {
+	output <- "🛑 Arrêt des containers..."
+	if err := m.runComposeStream(p, output, "down"); err != nil {
 		return fmt.Errorf("erreur lors de l'arrêt: %w", err)
 	}
-
-	fmt.Printf("✅ Projet %s arrêté et conteneurs supprimés\n", p.Name)
 	return nil
 }
 
-// RestartService redémarre un service (rapide, sans rebuild)
-func (m *Manager) RestartService(p *project.Project, serviceName string) error {
-	fmt.Printf("🔄 Redémarrage du service %s du projet %s...\n", serviceName, p.Name)
-	cmd := exec.Command("docker-compose", "-f", "docker-compose.yml", "-p", p.Name, "restart", serviceName)
-	cmd.Dir = p.Path
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
+// RestartServiceStream redémarre un service en streamant la sortie
+func (m *Manager) RestartServiceStream(p *project.Project, output chan<- string, serviceName string) error {
+	output <- "🔄 Redémarrage..."
+	args := []string{"restart"}
+	if serviceName != "" {
+		args = append(args, serviceName)
+	}
+	if err := m.runComposeStream(p, output, args...); err != nil {
 		return fmt.Errorf("erreur lors du redémarrage: %w", err)
 	}
+	return nil
+}
 
-	fmt.Printf("✅ Service %s redémarré avec succès\n", serviceName)
+// StopOrphanProjectStream arrête un container orphelin en streamant la sortie
+func (m *Manager) StopOrphanProjectStream(p *project.Project, output chan<- string) error {
+	output <- "🛑 Arrêt du container orphelin..."
+	cmd := exec.Command("docker", "ps", "-q", "--filter", fmt.Sprintf("label=com.docker.compose.project=%s", p.Name))
+	out, err := cmd.Output()
+	if err == nil && strings.TrimSpace(string(out)) != "" {
+		ids := strings.Fields(strings.TrimSpace(string(out)))
+		cmd = exec.Command("docker", append([]string{"stop"}, ids...)...)
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("erreur arrêt: %s", strings.TrimSpace(stderr.String()))
+		}
+		cmd = exec.Command("docker", append([]string{"rm"}, ids...)...)
+		cmd.Run()
+		return nil
+	}
+	cmd = exec.Command("docker", "stop", p.Name)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("erreur arrêt: %s", strings.TrimSpace(stderr.String()))
+	}
+	cmd = exec.Command("docker", "rm", p.Name)
+	cmd.Run()
 	return nil
 }
 
@@ -278,6 +374,122 @@ func appendUnique(existing []string, values []string) []string {
 	}
 
 	return existing
+}
+
+// DiscoverOrphanProjects liste les containers Docker en cours d'exécution
+// qui ne font partie d'aucun projet connu. Retourne des Project marqués Orphan.
+func (m *Manager) DiscoverOrphanProjects(knownNames map[string]bool) ([]project.Project, error) {
+	// Lister tous les containers en cours avec leur projet compose
+	cmd := exec.Command("docker", "ps", "--format", "{{.Label \"com.docker.compose.project\"}}\t{{.Names}}\t{{.ID}}")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	// Grouper par projet compose
+	type containerInfo struct {
+		names []string
+		count int
+	}
+	composeProjects := make(map[string]*containerInfo)
+
+	// Containers standalone (sans projet compose)
+	standaloneContainers := make(map[string]*containerInfo)
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 3)
+		composeName := strings.TrimSpace(parts[0])
+		containerName := ""
+		if len(parts) > 1 {
+			containerName = strings.TrimSpace(parts[1])
+		}
+
+		if composeName == "" {
+			// Container standalone (lancé via docker run / Docker Desktop)
+			if containerName != "" {
+				if _, exists := standaloneContainers[containerName]; !exists {
+					standaloneContainers[containerName] = &containerInfo{}
+				}
+				standaloneContainers[containerName].count++
+				standaloneContainers[containerName].names = append(standaloneContainers[containerName].names, containerName)
+			}
+		} else {
+			if _, exists := composeProjects[composeName]; !exists {
+				composeProjects[composeName] = &containerInfo{}
+			}
+			composeProjects[composeName].count++
+			if containerName != "" {
+				composeProjects[composeName].names = append(composeProjects[composeName].names, containerName)
+			}
+		}
+	}
+
+	var orphans []project.Project
+
+	// Projets compose non connus
+	for name, info := range composeProjects {
+		if knownNames[name] {
+			continue
+		}
+		orphans = append(orphans, project.Project{
+			Name:         name,
+			Running:      true,
+			ServiceCount: info.count,
+			Orphan:       true,
+		})
+	}
+
+	// Containers standalone
+	for name, info := range standaloneContainers {
+		if knownNames[name] {
+			continue
+		}
+		orphans = append(orphans, project.Project{
+			Name:         name,
+			Running:      true,
+			ServiceCount: info.count,
+			Orphan:       true,
+		})
+	}
+
+	return orphans, nil
+}
+
+// StopOrphanProject arrête un container/projet orphelin (sans docker-compose.yml)
+func (m *Manager) StopOrphanProject(p *project.Project) error {
+	// Essayer d'abord comme projet compose
+	cmd := exec.Command("docker", "ps", "-q", "--filter", fmt.Sprintf("label=com.docker.compose.project=%s", p.Name))
+	output, err := cmd.Output()
+	if err == nil && strings.TrimSpace(string(output)) != "" {
+		// C'est un projet compose — arrêter via docker compose
+		ids := strings.Fields(strings.TrimSpace(string(output)))
+		cmd = exec.Command("docker", append([]string{"stop"}, ids...)...)
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("erreur arrêt: %s", strings.TrimSpace(stderr.String()))
+		}
+		// Supprimer les containers
+		cmd = exec.Command("docker", append([]string{"rm"}, ids...)...)
+		cmd.Run() // best effort
+		return nil
+	}
+
+	// Sinon container standalone — arrêter par nom
+	cmd = exec.Command("docker", "stop", p.Name)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("erreur arrêt: %s", strings.TrimSpace(stderr.String()))
+	}
+	cmd = exec.Command("docker", "rm", p.Name)
+	cmd.Run() // best effort
+	return nil
 }
 
 // EnsureDockerRunning vérifie que Docker est accessible

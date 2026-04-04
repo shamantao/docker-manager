@@ -22,6 +22,7 @@ type Project struct {
 	Services     []Service
 	Running      bool
 	ServiceCount int
+	Orphan       bool // true si le container tourne sans être dans la config
 }
 
 // GetAbsolutePath retourne le chemin absolu du projet
@@ -48,7 +49,11 @@ func (p *Project) DockerComposeExists() bool {
 // StatusString retourne un string formaté du statut
 func (p *Project) StatusString() string {
 	if p.Running {
-		return fmt.Sprintf("▶ Running (%d services)", p.ServiceCount)
+		suffix := fmt.Sprintf("▶ Running (%d services)", p.ServiceCount)
+		if p.Orphan {
+			suffix += " 👻"
+		}
+		return suffix
 	}
 	return "⏹ Stopped"
 }

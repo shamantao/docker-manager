@@ -23,7 +23,7 @@ build: deps
 darwin-arm64: deps
 	GOOS=darwin GOARCH=arm64 go build -o docker-manager-arm64 -v .
 
-install: darwin-arm64
+install: build darwin-arm64
 	@echo "Installing docker-manager to /usr/local/bin (requires sudo)..."
 	@sudo cp docker-manager-arm64 /usr/local/bin/docker-manager
 	@sudo chmod +x /usr/local/bin/docker-manager

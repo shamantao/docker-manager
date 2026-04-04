@@ -4,6 +4,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/charmbracelet/log"
 
@@ -15,6 +17,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+// Version est la version unique de docker-manager
+const Version = "1.3.0"
 
 var logger = log.New(os.Stderr)
 
@@ -112,8 +117,31 @@ func main() {
 			logger.Fatal(err)
 		}
 
+	case "add":
+		if len(os.Args) < 3 {
+			fmt.Println("usage: docker-manager add <path>")
+			os.Exit(1)
+		}
+		if err := handleAdd(os.Args[2]); err != nil {
+			logger.Fatal(err)
+		}
+
+	case "remove":
+		if len(os.Args) < 3 {
+			fmt.Println("usage: docker-manager remove <project>")
+			os.Exit(1)
+		}
+		if err := handleRemove(os.Args[2]); err != nil {
+			logger.Fatal(err)
+		}
+
+	case "list":
+		if err := handleList(); err != nil {
+			logger.Fatal(err)
+		}
+
 	case "--version", "-v":
-		fmt.Println("Docker Manager v1.0.0")
+		fmt.Printf("Docker Manager v%s\n", Version)
 
 	case "--help", "-h", "help":
 		printHelp()
@@ -126,12 +154,15 @@ func main() {
 }
 
 func printHelp() {
-	fmt.Println(`Docker Manager v1.0.0
-
+	fmt.Printf("Docker Manager v%s\n", Version)
+	fmt.Print(`
 Usage:
   docker-manager <command> [options]
 
 Commands:
+  add <path>               Enregistre un projet Docker (chemin vers le dossier)
+  remove <project>         Retire un projet de la config
+  list                     Affiche les projets enregistrés
   start <project>          Démarre un projet (build + container)
   stop <project>           Arrête et supprime les containers
   restart <project>        Redémarre un projet (sans rebuild)
@@ -142,6 +173,10 @@ Commands:
   dashboard                Lance le dashboard interactif
 
 Exemples:
+  docker-manager add ~/kDrive/docker/docker-pbwww
+  docker-manager add /chemin/vers/mon-projet
+  docker-manager remove pbwww
+  docker-manager list
   docker-manager start pbwww
   docker-manager stop pbwww
   docker-manager restart pbwww nginx
@@ -182,7 +217,13 @@ func handleStart(projectName string) error {
 	}
 
 	mgr := docker.NewManager(targetProject.Path)
-	return mgr.StartProject(targetProject)
+	output := make(chan string, 64)
+	go func() {
+		for line := range output {
+			fmt.Println(line)
+		}
+	}()
+	return mgr.StartProjectStream(targetProject, output)
 }
 
 func handleStop(projectName string) error {
@@ -208,7 +249,13 @@ func handleStop(projectName string) error {
 	}
 
 	mgr := docker.NewManager(targetProject.Path)
-	return mgr.StopProject(targetProject)
+	output := make(chan string, 64)
+	go func() {
+		for line := range output {
+			fmt.Println(line)
+		}
+	}()
+	return mgr.StopProjectStream(targetProject, output)
 }
 
 func handleRestart(projectName string, serviceName string) error {
@@ -234,15 +281,13 @@ func handleRestart(projectName string, serviceName string) error {
 	}
 
 	mgr := docker.NewManager(targetProject.Path)
-
-	// Si pas de service spécifié, on redémarre le projet entier
-	if serviceName == "" {
-		fmt.Printf("🔄 Redémarrage complet du projet %s...\n", projectName)
-		// On peut implémenter un true restart ici
-		return mgr.RestartService(targetProject, "")
-	}
-
-	return mgr.RestartService(targetProject, serviceName)
+	output := make(chan string, 64)
+	go func() {
+		for line := range output {
+			fmt.Println(line)
+		}
+	}()
+	return mgr.RestartServiceStream(targetProject, output, serviceName)
 }
 
 func handleStatus() error {
@@ -260,8 +305,10 @@ func handleStatus() error {
 
 	mgr := docker.NewManager("")
 
+	knownNames := make(map[string]bool)
 	for _, p := range projects {
 		running, count, _ := mgr.GetStatus(&p)
+		knownNames[p.Name] = true
 
 		if running {
 			fmt.Printf("  %-20s ▶  Running (%d services)\n", p.Name, count)
@@ -270,7 +317,17 @@ func handleStatus() error {
 		}
 	}
 
-	fmt.Println("─────────────────────────────────────────\n")
+	// Containers orphelins
+	orphans, _ := mgr.DiscoverOrphanProjects(knownNames)
+	if len(orphans) > 0 {
+		fmt.Println("  ── containers hors config ──")
+		for _, o := range orphans {
+			fmt.Printf("  %-20s ▶  Running (%d services) 👻\n", o.Name, o.ServiceCount)
+		}
+	}
+
+	fmt.Println("─────────────────────────────────────────")
+	fmt.Println()
 	return nil
 }
 
@@ -348,7 +405,8 @@ func handleStatusProject(projectName string) error {
 		fmt.Printf("  ⚠️  docker-compose.yml manquant!\n")
 	}
 
-	fmt.Println("─────────────────────────────────────────\n")
+	fmt.Println("─────────────────────────────────────────")
+	fmt.Println()
 	return nil
 }
 
@@ -391,11 +449,17 @@ func handleDashboard() error {
 	mgr := docker.NewManager("")
 
 	// Charger les statuts
+	knownNames := make(map[string]bool)
 	for i := range projects {
 		running, count, _ := mgr.GetStatus(&projects[i])
 		projects[i].Running = running
 		projects[i].ServiceCount = count
+		knownNames[projects[i].Name] = true
 	}
+
+	// Ajouter les containers orphelins (non gérés par la config)
+	orphans, _ := mgr.DiscoverOrphanProjects(knownNames)
+	projects = append(projects, orphans...)
 
 	model := tui.NewModel(projects, mgr)
 	prog := tea.NewProgram(model)
@@ -449,5 +513,81 @@ func handleDaemon(action string) error {
 		fmt.Println("Utilisez: start, stop, ou status")
 		return nil
 	}
+	return nil
+}
+
+func handleAdd(dirPath string) error {
+	absPath, err := filepath.Abs(dirPath)
+	if err != nil {
+		return fmt.Errorf("chemin invalide: %w", err)
+	}
+
+	info, err := os.Stat(absPath)
+	if err != nil || !info.IsDir() {
+		return fmt.Errorf("dossier introuvable: %s", absPath)
+	}
+
+	composePath := filepath.Join(absPath, "docker-compose.yml")
+	if _, err := os.Stat(composePath); os.IsNotExist(err) {
+		return fmt.Errorf("docker-compose.yml non trouvé dans %s", absPath)
+	}
+
+	// Dérive le nom depuis le dossier (retire le préfixe "docker-" si présent)
+	name := strings.ToLower(strings.TrimPrefix(filepath.Base(absPath), "docker-"))
+
+	if err := config.AddProject(name, absPath); err != nil {
+		return err
+	}
+
+	fmt.Printf("✅ Projet '%s' ajouté → %s\n", name, absPath)
+
+	// Ouvrir le dashboard si Docker est disponible
+	if err := docker.EnsureDockerRunning(); err != nil {
+		fmt.Println("ℹ️  Docker daemon inactif — démarrez-le puis : docker-manager dashboard")
+		return nil
+	}
+	fmt.Println("📂 Ouverture du dashboard...")
+	return handleDashboard()
+}
+
+func handleRemove(name string) error {
+	if err := config.RemoveProject(name); err != nil {
+		return err
+	}
+	fmt.Printf("✅ Projet '%s' retiré de la config\n", name)
+	return nil
+}
+
+func handleList() error {
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("\n📋 Projets enregistrés dans ~/.docker-manager/projects.yml")
+	fmt.Println("─────────────────────────────────────────")
+
+	if cfg.Root != "" {
+		fmt.Printf("  📂 auto-discover root : %s\n", cfg.Root)
+	}
+	for _, r := range cfg.Roots {
+		fmt.Printf("  📂 auto-discover root : %s\n", r)
+	}
+
+	if len(cfg.Projects) == 0 {
+		fmt.Println("  (aucun projet enregistré)")
+		fmt.Println("\n  Ajoutez un projet : docker-manager add /chemin/vers/projet")
+	} else {
+		for name, p := range cfg.Projects {
+			warn := ""
+			if _, err := os.Stat(filepath.Join(p.Path, "docker-compose.yml")); os.IsNotExist(err) {
+				warn = " ⚠️  (docker-compose.yml introuvable)"
+			}
+			fmt.Printf("  ▶ %-20s → %s%s\n", name, p.Path, warn)
+		}
+	}
+
+	fmt.Println("─────────────────────────────────────────")
+	fmt.Println()
 	return nil
 }

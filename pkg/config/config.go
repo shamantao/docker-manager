@@ -23,8 +23,9 @@ type ProjectConfig struct {
 
 // Config contient la configuration globale
 type Config struct {
-	Root     string                     `yaml:"root,omitempty"`
-	Projects map[string]ProjectConfig   `yaml:"projects"`
+	Root     string                    `yaml:"root,omitempty"`  // racine unique (backward compat)
+	Roots    []string                  `yaml:"roots,omitempty"` // racines multiples pour auto-découverte
+	Projects map[string]ProjectConfig  `yaml:"projects"`        // projets enregistrés via "add"
 }
 
 // EnsureDefaultConfig crée le fichier de config par défaut s'il n'existe pas
@@ -42,9 +43,8 @@ func EnsureDefaultConfig() error {
 		return fmt.Errorf("erreur lors de la création du répertoire: %w", err)
 	}
 
-	// Créer un fichier de config par défaut
+	// Créer un fichier de config vide
 	defaultConfig := &Config{
-		Root:     filepath.Join(os.Getenv("HOME"), "docker"),
 		Projects: make(map[string]ProjectConfig),
 	}
 
@@ -109,4 +109,27 @@ func (c *Config) GetProjectConfig(projectName string) ProjectConfig {
 		return cfg
 	}
 	return ProjectConfig{}
+}
+
+// AddProject enregistre un projet depuis un chemin absolu
+func AddProject(name, path string) error {
+	cfg, err := LoadConfig()
+	if err != nil {
+		return err
+	}
+	cfg.Projects[name] = ProjectConfig{Path: path}
+	return SaveConfig(cfg)
+}
+
+// RemoveProject supprime un projet de la config
+func RemoveProject(name string) error {
+	cfg, err := LoadConfig()
+	if err != nil {
+		return err
+	}
+	if _, exists := cfg.Projects[name]; !exists {
+		return fmt.Errorf("projet '%s' introuvable dans la config", name)
+	}
+	delete(cfg.Projects, name)
+	return SaveConfig(cfg)
 }
