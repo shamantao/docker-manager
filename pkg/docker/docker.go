@@ -25,26 +25,43 @@ func NewManager(workDir string) *Manager {
 	}
 }
 
+// composeFileName retourne le nom du fichier compose du projet (docker-compose.yml
+// par défaut, mais compose.yaml & co sont supportés).
+func composeFileName(p *project.Project) string {
+	if p.ComposePath != "" {
+		return filepath.Base(p.ComposePath)
+	}
+	return "docker-compose.yml"
+}
+
+// composeExec construit la commande compose à exécuter dans le dossier du projet.
+// La commande sous-jacente est détectée dynamiquement (docker compose v2 ou
+// docker-compose v1), ce qui rend l'outil portable entre machines.
+// Si un .env existe, on passe par bash pour résoudre l'interpolation de variables.
+func composeExec(p *project.Project, args ...string) *exec.Cmd {
+	composeArgs := append([]string{"-f", composeFileName(p), "-p", p.Name}, args...)
+
+	var cmd *exec.Cmd
+	if _, err := os.Stat(filepath.Join(p.Path, ".env")); err == nil {
+		// --env-file /dev/null empêche compose de relire .env avec son propre
+		// parser (qui ne supporte pas l'interpolation bash)
+		composeArgs = append([]string{"--env-file", "/dev/null"}, composeArgs...)
+		shellCmd := "set -a && source .env && set +a && " + ComposeCommandString() + " " + shelljoin(composeArgs)
+		cmd = exec.Command("bash", "-c", shellCmd)
+	} else {
+		cc := ComposeCommand()
+		full := append(append([]string{}, cc[1:]...), composeArgs...)
+		cmd = exec.Command(cc[0], full...)
+	}
+	cmd.Dir = p.Path
+	return cmd
+}
+
 // runCompose exécute une commande docker-compose dans le répertoire du projet.
 // Si un fichier .env existe, il est sourcé via bash pour résoudre l'interpolation de variables.
 // Stdout et stderr sont capturés pour pouvoir afficher les erreurs dans le TUI.
 func (m *Manager) runCompose(p *project.Project, args ...string) (string, error) {
-	envFile := filepath.Join(p.Path, ".env")
-
-	var cmd *exec.Cmd
-	composeArgs := append([]string{"-f", "docker-compose.yml", "-p", p.Name}, args...)
-
-	if _, err := os.Stat(envFile); err == nil {
-		// .env existe → passer par bash pour résoudre l'interpolation
-		// --env-file /dev/null empêche docker-compose de relire .env avec son
-		// propre parser (qui ne supporte pas l'interpolation bash)
-		composeArgs = append([]string{"--env-file", "/dev/null"}, composeArgs...)
-		shellCmd := "set -a && source .env && set +a && docker-compose " + shelljoin(composeArgs)
-		cmd = exec.Command("bash", "-c", shellCmd)
-	} else {
-		cmd = exec.Command("docker-compose", composeArgs...)
-	}
-	cmd.Dir = p.Path
+	cmd := composeExec(p, args...)
 
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
@@ -74,19 +91,7 @@ func shelljoin(args []string) string {
 // Le channel est fermé quand la commande se termine.
 // Retourne une erreur si la commande échoue.
 func (m *Manager) runComposeStream(p *project.Project, output chan<- string, args ...string) error {
-	envFile := filepath.Join(p.Path, ".env")
-
-	var cmd *exec.Cmd
-	composeArgs := append([]string{"-f", "docker-compose.yml", "-p", p.Name}, args...)
-
-	if _, err := os.Stat(envFile); err == nil {
-		composeArgs = append([]string{"--env-file", "/dev/null"}, composeArgs...)
-		shellCmd := "set -a && source .env && set +a && docker-compose " + shelljoin(composeArgs)
-		cmd = exec.Command("bash", "-c", shellCmd)
-	} else {
-		cmd = exec.Command("docker-compose", composeArgs...)
-	}
-	cmd.Dir = p.Path
+	cmd := composeExec(p, args...)
 
 	// Combiner stdout+stderr dans un seul pipe
 	pr, pw := io.Pipe()
@@ -148,39 +153,10 @@ func (m *Manager) RestartServiceStream(p *project.Project, output chan<- string,
 	return nil
 }
 
-// StopOrphanProjectStream arrête un container orphelin en streamant la sortie
-func (m *Manager) StopOrphanProjectStream(p *project.Project, output chan<- string) error {
-	output <- "🛑 Arrêt du container orphelin..."
-	cmd := exec.Command("docker", "ps", "-q", "--filter", fmt.Sprintf("label=com.docker.compose.project=%s", p.Name))
-	out, err := cmd.Output()
-	if err == nil && strings.TrimSpace(string(out)) != "" {
-		ids := strings.Fields(strings.TrimSpace(string(out)))
-		cmd = exec.Command("docker", append([]string{"stop"}, ids...)...)
-		var stderr strings.Builder
-		cmd.Stderr = &stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("erreur arrêt: %s", strings.TrimSpace(stderr.String()))
-		}
-		cmd = exec.Command("docker", append([]string{"rm"}, ids...)...)
-		cmd.Run()
-		return nil
-	}
-	cmd = exec.Command("docker", "stop", p.Name)
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("erreur arrêt: %s", strings.TrimSpace(stderr.String()))
-	}
-	cmd = exec.Command("docker", "rm", p.Name)
-	cmd.Run()
-	return nil
-}
-
 // GetStatus récupère le statut d'un projet
 // Retourne: (running, containerCount, detailedError)
 func (m *Manager) GetStatus(p *project.Project) (bool, int, error) {
-	cmd := exec.Command("docker-compose", "-f", "docker-compose.yml", "-p", p.Name, "ps", "-q")
-	cmd.Dir = p.Path
+	cmd := composeExec(p, "ps", "-q")
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -201,8 +177,7 @@ func (m *Manager) GetStatus(p *project.Project) (bool, int, error) {
 
 // GetStatusDetailed récupère le statut détaillé avec des informations d'erreur
 func (m *Manager) GetStatusDetailed(p *project.Project) (bool, int, string) {
-	cmd := exec.Command("docker-compose", "-f", "docker-compose.yml", "-p", p.Name, "ps", "-q")
-	cmd.Dir = p.Path
+	cmd := composeExec(p, "ps", "-q")
 
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
@@ -233,7 +208,7 @@ func (m *Manager) GetStatusDetailed(p *project.Project) (bool, int, string) {
 
 // GetLogs récupère les logs d'un projet
 func (m *Manager) GetLogs(p *project.Project, serviceName string, follow bool) error {
-	args := []string{"-f", "docker-compose.yml", "-p", p.Name, "logs"}
+	args := []string{"logs"}
 	if follow {
 		args = append(args, "-f")
 	}
@@ -241,8 +216,7 @@ func (m *Manager) GetLogs(p *project.Project, serviceName string, follow bool) e
 		args = append(args, serviceName)
 	}
 
-	cmd := exec.Command("docker-compose", args...)
-	cmd.Dir = p.Path
+	cmd := composeExec(p, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
@@ -252,8 +226,7 @@ func (m *Manager) GetLogs(p *project.Project, serviceName string, follow bool) e
 
 // GetServices retourne la liste des services d'un projet
 func (m *Manager) GetServices(p *project.Project) ([]string, error) {
-	cmd := exec.Command("docker-compose", "-f", "docker-compose.yml", "config", "--services")
-	cmd.Dir = p.Path
+	cmd := composeExec(p, "config", "--services")
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -376,131 +349,22 @@ func appendUnique(existing []string, values []string) []string {
 	return existing
 }
 
-// DiscoverOrphanProjects liste les containers Docker en cours d'exécution
-// qui ne font partie d'aucun projet connu. Retourne des Project marqués Orphan.
-func (m *Manager) DiscoverOrphanProjects(knownNames map[string]bool) ([]project.Project, error) {
-	// Lister tous les containers en cours avec leur projet compose
-	cmd := exec.Command("docker", "ps", "--format", "{{.Label \"com.docker.compose.project\"}}\t{{.Names}}\t{{.ID}}")
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
-
-	// Grouper par projet compose
-	type containerInfo struct {
-		names []string
-		count int
-	}
-	composeProjects := make(map[string]*containerInfo)
-
-	// Containers standalone (sans projet compose)
-	standaloneContainers := make(map[string]*containerInfo)
-
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, "\t", 3)
-		composeName := strings.TrimSpace(parts[0])
-		containerName := ""
-		if len(parts) > 1 {
-			containerName = strings.TrimSpace(parts[1])
-		}
-
-		if composeName == "" {
-			// Container standalone (lancé via docker run / Docker Desktop)
-			if containerName != "" {
-				if _, exists := standaloneContainers[containerName]; !exists {
-					standaloneContainers[containerName] = &containerInfo{}
-				}
-				standaloneContainers[containerName].count++
-				standaloneContainers[containerName].names = append(standaloneContainers[containerName].names, containerName)
-			}
-		} else {
-			if _, exists := composeProjects[composeName]; !exists {
-				composeProjects[composeName] = &containerInfo{}
-			}
-			composeProjects[composeName].count++
-			if containerName != "" {
-				composeProjects[composeName].names = append(composeProjects[composeName].names, containerName)
-			}
-		}
-	}
-
-	var orphans []project.Project
-
-	// Projets compose non connus
-	for name, info := range composeProjects {
-		if knownNames[name] {
-			continue
-		}
-		orphans = append(orphans, project.Project{
-			Name:         name,
-			Running:      true,
-			ServiceCount: info.count,
-			Orphan:       true,
-		})
-	}
-
-	// Containers standalone
-	for name, info := range standaloneContainers {
-		if knownNames[name] {
-			continue
-		}
-		orphans = append(orphans, project.Project{
-			Name:         name,
-			Running:      true,
-			ServiceCount: info.count,
-			Orphan:       true,
-		})
-	}
-
-	return orphans, nil
-}
-
-// StopOrphanProject arrête un container/projet orphelin (sans docker-compose.yml)
-func (m *Manager) StopOrphanProject(p *project.Project) error {
-	// Essayer d'abord comme projet compose
-	cmd := exec.Command("docker", "ps", "-q", "--filter", fmt.Sprintf("label=com.docker.compose.project=%s", p.Name))
-	output, err := cmd.Output()
-	if err == nil && strings.TrimSpace(string(output)) != "" {
-		// C'est un projet compose — arrêter via docker compose
-		ids := strings.Fields(strings.TrimSpace(string(output)))
-		cmd = exec.Command("docker", append([]string{"stop"}, ids...)...)
-		var stderr strings.Builder
-		cmd.Stderr = &stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("erreur arrêt: %s", strings.TrimSpace(stderr.String()))
-		}
-		// Supprimer les containers
-		cmd = exec.Command("docker", append([]string{"rm"}, ids...)...)
-		cmd.Run() // best effort
-		return nil
-	}
-
-	// Sinon container standalone — arrêter par nom
-	cmd = exec.Command("docker", "stop", p.Name)
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("erreur arrêt: %s", strings.TrimSpace(stderr.String()))
-	}
-	cmd = exec.Command("docker", "rm", p.Name)
-	cmd.Run() // best effort
-	return nil
-}
-
 // EnsureDockerRunning vérifie que Docker est accessible
 func EnsureDockerRunning() error {
 	installed, _ := CheckDockerInstallation()
 	if !installed {
-		return fmt.Errorf("❌ Docker n'est pas installé.\n📖 Visitez: https://www.docker.com/products/docker-desktop")
+		return fmt.Errorf("❌ Docker n'est pas installé.\n📖 Voir: %s", GetDockerInstallURL())
 	}
 
-	running, _ := CheckDockerDaemonStatus()
+	running, err := CheckDockerDaemonStatus()
 	if !running {
+		// Sous Linux, "permission denied" signifie daemon actif mais accès refusé :
+		// l'utilisateur n'est pas dans le groupe docker.
+		if err != nil && strings.Contains(err.Error(), "permission denied") {
+			return fmt.Errorf("❌ Accès au daemon Docker refusé.\n" +
+				"Ajoutez votre utilisateur au groupe docker :\n" +
+				"  sudo usermod -aG docker $USER   (puis reconnectez-vous)")
+		}
 		return fmt.Errorf("⏹️  Docker daemon est arrêté.\nUsez: docker-manager daemon start")
 	}
 	return nil
@@ -516,8 +380,16 @@ func CheckDockerInstallation() (bool, error) {
 // CheckDockerDaemonStatus vérifie si le daemon Docker est actif
 func CheckDockerDaemonStatus() (bool, error) {
 	cmd := exec.Command("docker", "info")
-	err := cmd.Run()
-	return err == nil, nil
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = err.Error()
+		}
+		return false, fmt.Errorf("%s", detail)
+	}
+	return true, nil
 }
 
 // StartDockerDaemon démarre Docker
@@ -574,5 +446,8 @@ func StopDockerDaemon() error {
 
 // GetDockerInstallURL retourne l'URL d'installation de Docker selon l'OS
 func GetDockerInstallURL() string {
+	if runtime.GOOS == "linux" {
+		return "https://docs.docker.com/engine/install/"
+	}
 	return "https://www.docker.com/products/docker-desktop"
 }

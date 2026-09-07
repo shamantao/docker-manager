@@ -7,25 +7,39 @@ For internal code structure and implementation details, see [docs/DEV-ARCHITECTU
 
 ## Features
 
-- Auto-discovery of `docker-*` projects from configured roots
-- Fast CLI: add, remove, list, start, stop, restart, status, logs
+- **Zero-config discovery**: finds projects on any machine, from Docker's own labels
+- Shows **running**, **partially running**, and **installed-but-stopped** containers
+- Manages both `docker compose` projects and plain `docker run` containers
+- Fast CLI: add, remove, list, start, stop, restart, update, status, logs
 - Detailed status for a single project (services + URLs)
 - Interactive TUI dashboard with spinner + live operation logs
-- Detection of running containers outside config (shown as orphan entries)
 - Docker daemon management (start, stop, status)
+- Runs on macOS, Linux, and Raspberry Pi (arm64 / armv7)
 
 ## Requirements
 
-- Docker Desktop (or Docker Engine)
-- docker-compose v1 or Docker Compose v2
+- Docker Engine or Docker Desktop
+- Docker Compose v2 (`docker compose`) or v1 (`docker-compose`) — auto-detected
 
-## Install (from source)
+## Install
+
+On the machine itself (compiles if Go is available, otherwise uses a prebuilt binary):
 
 ```bash
-make install
+./install.sh
 ```
 
-This builds and installs `docker-manager` into `/usr/local/bin`.
+Deploying to a Raspberry Pi from your dev machine (no Go needed on the Pi):
+
+```bash
+make release                                   # builds every target
+scp docker-manager-linux-arm64 install.sh pi@raspberry:~/
+ssh pi@raspberry "./install.sh"                # picks the matching binary
+```
+
+`install.sh` detects OS/architecture (`darwin`/`linux`, `arm64`/`amd64`/`arm`),
+installs into `/usr/local/bin` (override with `PREFIX=`), and warns if the Docker
+daemon is unreachable.
 
 ## Usage
 
@@ -39,7 +53,7 @@ docker-manager status
 docker-manager list
 
 # Add/remove explicit project entries
-docker-manager add ~/kDrive/docker/docker-pbwww
+docker-manager add ~/docker/docker-pbwww
 docker-manager remove pbwww
 
 # Detailed status for one project
@@ -53,6 +67,9 @@ docker-manager stop pbwww
 
 # Fast restart (no rebuild)
 docker-manager restart pbwww nginx
+
+# Update images already used by the project, then recreate
+docker-manager update pbwww
 
 # Logs (use -f for follow)
 docker-manager logs pbwww
@@ -72,34 +89,67 @@ docker-manager dashboard
 
 Keys:
 - `↑/↓` or `k/j`: navigate
-- `S`: start
-- `D`: stop (down)
-- `R`: restart
-- `Q`: quit
+- `s`: start
+- `d`: stop (compose `down`, or `docker stop` for standalone containers)
+- `r`: restart
+- `u`: update images (pull + recreate)
+- `R`: reload the inventory
+- `q`: quit
 
 During long operations (image pull/build/up/down), the dashboard shows:
 - an animated spinner
 - live output lines from Docker Compose
 - final success/error status
 
-Orphan running containers (not managed by configured projects) are shown with a `👻` marker and can be stopped from the dashboard.
+Status markers:
+
+| Marker | Meaning |
+| --- | --- |
+| `▶ Running` | all containers up |
+| `◐ Partiel` | some containers up, some stopped |
+| `⏸ Installé, arrêté` | containers exist on the machine but are stopped |
+| `⏹ Stopped` | project found on disk, no container created |
+| `👻` | not in config — located through Docker |
+| `⬦` | plain container, not managed by docker-compose |
 
 ## Project discovery
 
-Docker Manager can discover projects from roots and explicit config entries.
+Discovery combines two independent sources and merges them, so moving the binary
+to another machine requires no configuration at all.
 
-Discovery order:
-1. `DOCKER_MANAGER_ROOT` environment variable (single root override)
+**1. Docker's own inventory** (`docker ps -a`). Compose stamps every container it
+creates with `com.docker.compose.project`, `...project.working_dir` and
+`...project.config_files`. Reading those labels tells Docker Manager which
+projects exist, where their compose file lives, and how many containers are
+running versus stopped. Stopped containers are included — that is how
+"installed but not started" shows up. Containers started with `docker run` have
+no such labels and are listed individually.
+
+**2. A filesystem scan** of root directories (2 levels deep), which also catches
+projects whose containers have never been created:
+
+1. `DOCKER_MANAGER_ROOT` environment variable
 2. `roots` list in `~/.docker-manager/projects.yml`
 3. `root` in `~/.docker-manager/projects.yml` (backward compatibility)
-4. explicit `projects` entries added with `docker-manager add`
+4. built-in defaults when nothing above exists on this machine:
+   `~/docker`, `~/dockers`, `~/stacks`, `~/containers`, `~/compose`, `~`,
+   `/opt/docker`, `/opt/stacks`, `/opt/containers`, `/srv/docker`, `/srv`,
+   `/volume1/docker`, `/home/pi/docker`
 
-Auto-discovered folders must match:
+A folder is a project if it contains `docker-compose.yml`, `docker-compose.yaml`,
+`compose.yml` or `compose.yaml`. The `docker-` prefix is no longer required.
+Hidden folders, `node_modules` and similar are skipped.
 
-- name starts with `docker-`
-- contains a `docker-compose.yml`
+Entries are merged by path first, then by name (tolerating the `docker-` prefix).
+Roots that do not exist on the current machine are silently ignored, and if a
+copied config points only at missing paths, the built-in defaults take over.
 
-Project names are normalized to lowercase for Docker Compose compatibility.
+## Updating images
+
+`docker-manager update <project>` runs `compose pull` followed by `compose up -d`.
+It only refreshes images the project already references — it never downloads an
+image that is not already part of the project. For a standalone container, the
+image is pulled and you are told to recreate the container to apply it.
 
 ## Detailed status URLs
 
@@ -125,7 +175,7 @@ This file contains:
 
 ```yaml
 roots:
-  - /Users/you/kDrive/docker
+  - /home/you/docker
 projects: {}
 ```
 
@@ -180,7 +230,7 @@ make clean
 Version is defined in a single source of truth in [main.go](main.go):
 
 ```go
-const Version = "1.3.0"
+const Version = "1.4.0"
 ```
 
 Use `docker-manager --version` to display it.

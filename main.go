@@ -19,7 +19,7 @@ import (
 )
 
 // Version est la version unique de docker-manager
-const Version = "1.3.0"
+const Version = "1.4.0"
 
 var logger = log.New(os.Stderr)
 
@@ -66,6 +66,15 @@ func main() {
 			service = os.Args[3]
 		}
 		if err := handleRestart(os.Args[2], service); err != nil {
+			logger.Fatal(err)
+		}
+
+	case "update":
+		if len(os.Args) < 3 {
+			fmt.Println("usage: docker-manager update <project>")
+			os.Exit(1)
+		}
+		if err := handleUpdate(os.Args[2]); err != nil {
 			logger.Fatal(err)
 		}
 
@@ -166,6 +175,8 @@ Commands:
   start <project>          Démarre un projet (build + container)
   stop <project>           Arrête et supprime les containers
   restart <project>        Redémarre un projet (sans rebuild)
+  update <project>         Met à jour les images du projet puis recrée
+                           (pull des images déjà utilisées uniquement)
   status [project]         Affiche le statut (global ou d'un projet)
   logs <project> [service] Affiche les logs
                            Options: -f (follow en temps réel)
@@ -173,13 +184,14 @@ Commands:
   dashboard                Lance le dashboard interactif
 
 Exemples:
-  docker-manager add ~/kDrive/docker/docker-pbwww
+  docker-manager add ~/docker/docker-pbwww
   docker-manager add /chemin/vers/mon-projet
   docker-manager remove pbwww
   docker-manager list
   docker-manager start pbwww
   docker-manager stop pbwww
   docker-manager restart pbwww nginx
+  docker-manager update pbwww              # pull + recreate
   docker-manager status                    # Tous les projets
   docker-manager status pbwww              # Détail d'un projet
   docker-manager logs pbwww -f
@@ -194,100 +206,108 @@ Options:
 `)
 }
 
-func handleStart(projectName string) error {
-	if err := docker.EnsureDockerRunning(); err != nil {
-		return err
-	}
-
-	projects, err := discovery.DiscoverInDefaultPath()
+// loadProjects retourne l'inventaire complet de la machine (disque + Docker)
+func loadProjects() ([]project.Project, *docker.Manager, error) {
+	mgr := docker.NewManager("")
+	projects, err := discovery.DiscoverAll(mgr)
 	if err != nil {
-		return err
+		return projects, mgr, err
 	}
+	return projects, mgr, nil
+}
 
-	var targetProject *project.Project
+// findProject retrouve un projet par son nom (tolérant au préfixe "docker-")
+func findProject(projects []project.Project, name string) (*project.Project, error) {
+	normalized := strings.ToLower(strings.TrimPrefix(name, "docker-"))
 	for i := range projects {
-		if projects[i].Name == projectName {
-			targetProject = &projects[i]
-			break
+		if projects[i].Name == name {
+			return &projects[i], nil
 		}
 	}
-
-	if targetProject == nil {
-		return fmt.Errorf("projet '%s' non trouvé", projectName)
+	for i := range projects {
+		if projects[i].Name == normalized {
+			return &projects[i], nil
+		}
 	}
+	return nil, fmt.Errorf("projet '%s' non trouvé", name)
+}
 
-	mgr := docker.NewManager(targetProject.Path)
+// streamOutput exécute une opération en affichant sa sortie au fil de l'eau
+func streamOutput(fn func(chan<- string) error) error {
 	output := make(chan string, 64)
+	done := make(chan struct{})
 	go func() {
 		for line := range output {
 			fmt.Println(line)
 		}
+		close(done)
 	}()
-	return mgr.StartProjectStream(targetProject, output)
+	err := fn(output)
+	close(output)
+	<-done
+	return err
+}
+
+// handleAction applique start/stop/restart/update à un projet, qu'il soit géré
+// par docker-compose ou par de simples containers (docker run).
+func handleAction(action, projectName, serviceName string) error {
+	if err := docker.EnsureDockerRunning(); err != nil {
+		return err
+	}
+
+	projects, mgr, err := loadProjects()
+	if err != nil {
+		return err
+	}
+
+	target, err := findProject(projects, projectName)
+	if err != nil {
+		return err
+	}
+
+	compose := target.DockerComposeExists()
+	if !compose && target.TotalCount == 0 {
+		return fmt.Errorf("projet '%s' : ni fichier compose ni container connu", target.Name)
+	}
+
+	return streamOutput(func(out chan<- string) error {
+		switch action {
+		case "start":
+			if compose {
+				return mgr.StartProjectStream(target, out)
+			}
+			return mgr.StartContainersStream(target, out)
+		case "stop":
+			if compose {
+				return mgr.StopProjectStream(target, out)
+			}
+			return mgr.StopContainersStream(target, out)
+		case "restart":
+			if compose {
+				return mgr.RestartServiceStream(target, out, serviceName)
+			}
+			return mgr.RestartContainersStream(target, out)
+		case "update":
+			return mgr.UpdateProjectStream(target, out)
+		}
+		return fmt.Errorf("action inconnue: %s", action)
+	})
+}
+
+func handleStart(projectName string) error {
+	return handleAction("start", projectName, "")
 }
 
 func handleStop(projectName string) error {
-	if err := docker.EnsureDockerRunning(); err != nil {
-		return err
-	}
-
-	projects, err := discovery.DiscoverInDefaultPath()
-	if err != nil {
-		return err
-	}
-
-	var targetProject *project.Project
-	for i := range projects {
-		if projects[i].Name == projectName {
-			targetProject = &projects[i]
-			break
-		}
-	}
-
-	if targetProject == nil {
-		return fmt.Errorf("projet '%s' non trouvé", projectName)
-	}
-
-	mgr := docker.NewManager(targetProject.Path)
-	output := make(chan string, 64)
-	go func() {
-		for line := range output {
-			fmt.Println(line)
-		}
-	}()
-	return mgr.StopProjectStream(targetProject, output)
+	return handleAction("stop", projectName, "")
 }
 
 func handleRestart(projectName string, serviceName string) error {
-	if err := docker.EnsureDockerRunning(); err != nil {
-		return err
-	}
+	return handleAction("restart", projectName, serviceName)
+}
 
-	projects, err := discovery.DiscoverInDefaultPath()
-	if err != nil {
-		return err
-	}
-
-	var targetProject *project.Project
-	for i := range projects {
-		if projects[i].Name == projectName {
-			targetProject = &projects[i]
-			break
-		}
-	}
-
-	if targetProject == nil {
-		return fmt.Errorf("projet '%s' non trouvé", projectName)
-	}
-
-	mgr := docker.NewManager(targetProject.Path)
-	output := make(chan string, 64)
-	go func() {
-		for line := range output {
-			fmt.Println(line)
-		}
-	}()
-	return mgr.RestartServiceStream(targetProject, output, serviceName)
+func handleUpdate(projectName string) error {
+	return handleAction("update", projectName, "")
 }
 
 func handleStatus() error {
@@ -295,7 +315,7 @@ func handleStatus() error {
 		return err
 	}
 
-	projects, err := discovery.DiscoverInDefaultPath()
+	projects, _, err := loadProjects()
 	if err != nil {
 		return err
 	}
@@ -303,30 +323,18 @@ func handleStatus() error {
 	fmt.Println("\n📊 Statut des projets Docker")
 	fmt.Println("─────────────────────────────────────────")
 
-	mgr := docker.NewManager("")
-
-	knownNames := make(map[string]bool)
-	for _, p := range projects {
-		running, count, _ := mgr.GetStatus(&p)
-		knownNames[p.Name] = true
-
-		if running {
-			fmt.Printf("  %-20s ▶  Running (%d services)\n", p.Name, count)
-		} else {
-			fmt.Printf("  %-20s ⏹  Stopped\n", p.Name)
-		}
+	if len(projects) == 0 {
+		fmt.Println("  (aucun projet ni container détecté sur cette machine)")
 	}
 
-	// Containers orphelins
-	orphans, _ := mgr.DiscoverOrphanProjects(knownNames)
-	if len(orphans) > 0 {
-		fmt.Println("  ── containers hors config ──")
-		for _, o := range orphans {
-			fmt.Printf("  %-20s ▶  Running (%d services) 👻\n", o.Name, o.ServiceCount)
-		}
+	for i := range projects {
+		p := &projects[i]
+		fmt.Printf("  %-24s %s\n", p.Name, p.StatusString())
 	}
 
 	fmt.Println("─────────────────────────────────────────")
+	fmt.Println("  ▶ en cours   ◐ partiel   ⏸ installé, arrêté   ⏹ arrêté")
+	fmt.Println("  👻 hors config   ⬦ container hors docker-compose")
 	fmt.Println()
 	return nil
 }
@@ -336,36 +344,34 @@ func handleStatusProject(projectName string) error {
 		return err
 	}
 
-	projects, err := discovery.DiscoverInDefaultPath()
+	projects, mgr, err := loadProjects()
 	if err != nil {
 		return err
 	}
 
-	var targetProject *project.Project
-	for i := range projects {
-		if projects[i].Name == projectName {
-			targetProject = &projects[i]
-			break
-		}
+	targetProject, err := findProject(projects, projectName)
+	if err != nil {
+		return err
 	}
-
-	if targetProject == nil {
-		return fmt.Errorf("projet '%s' non trouvé", projectName)
-	}
-
-	mgr := docker.NewManager(targetProject.Path)
 
 	fmt.Println()
 	fmt.Printf("📊 Status détaillé : %s\n", targetProject.Name)
 	fmt.Println("─────────────────────────────────────────")
+	fmt.Printf("  Status   : %s\n", targetProject.StatusString())
 
-	// Utiliser GetStatusDetailed pour avoir plus d'infos
-	running, _, statusMsg := mgr.GetStatusDetailed(targetProject)
+	if len(targetProject.Containers) > 0 {
+		fmt.Printf("  Contain. : %s\n", strings.Join(targetProject.Containers, ", "))
+	}
+	if len(targetProject.Images) > 0 {
+		fmt.Printf("  Images   : %s\n", strings.Join(targetProject.Images, ", "))
+	}
 
-	if running {
-		fmt.Printf("  Status   : ▶ %s\n", statusMsg)
-	} else {
-		fmt.Printf("  Status   : ⏹ %s\n", statusMsg)
+	if !targetProject.DockerComposeExists() {
+		// Projet sans fichier compose : l'état vient uniquement de Docker
+		fmt.Println("  Compose  : (aucun fichier compose sur cette machine)")
+		fmt.Println("─────────────────────────────────────────")
+		fmt.Println()
+		return nil
 	}
 
 	// Essayer de récupérer les services
@@ -400,11 +406,6 @@ func handleStatusProject(projectName string) error {
 	fmt.Printf("  Path     : %s\n", targetProject.Path)
 	fmt.Printf("  Compose  : %s\n", targetProject.ComposePath)
 
-	// Vérifier que les fichiers existent
-	if _, err := os.Stat(targetProject.ComposePath); os.IsNotExist(err) {
-		fmt.Printf("  ⚠️  docker-compose.yml manquant!\n")
-	}
-
 	fmt.Println("─────────────────────────────────────────")
 	fmt.Println()
 	return nil
@@ -415,24 +416,20 @@ func handleLogs(projectName string, serviceName string, follow bool) error {
 		return err
 	}
 
-	projects, err := discovery.DiscoverInDefaultPath()
+	projects, mgr, err := loadProjects()
 	if err != nil {
 		return err
 	}
 
-	var targetProject *project.Project
-	for i := range projects {
-		if projects[i].Name == projectName {
-			targetProject = &projects[i]
-			break
-		}
+	targetProject, err := findProject(projects, projectName)
+	if err != nil {
+		return err
 	}
 
-	if targetProject == nil {
-		return fmt.Errorf("projet '%s' non trouvé", projectName)
+	if !targetProject.DockerComposeExists() {
+		// Pas de fichier compose : logs directs du container
+		return mgr.GetContainerLogs(targetProject, follow)
 	}
-
-	mgr := docker.NewManager(targetProject.Path)
 	return mgr.GetLogs(targetProject, serviceName, follow)
 }
 
@@ -441,27 +438,20 @@ func handleDashboard() error {
 		return err
 	}
 
-	projects, err := discovery.DiscoverInDefaultPath()
+	projects, mgr, err := loadProjects()
 	if err != nil {
 		return err
 	}
 
-	mgr := docker.NewManager("")
-
-	// Charger les statuts
-	knownNames := make(map[string]bool)
-	for i := range projects {
-		running, count, _ := mgr.GetStatus(&projects[i])
-		projects[i].Running = running
-		projects[i].ServiceCount = count
-		knownNames[projects[i].Name] = true
-	}
-
-	// Ajouter les containers orphelins (non gérés par la config)
-	orphans, _ := mgr.DiscoverOrphanProjects(knownNames)
-	projects = append(projects, orphans...)
-
 	model := tui.NewModel(projects, mgr)
+	// Permet au dashboard de relire l'inventaire (touche R) après chaque opération
+	model.SetRefresh(func() []project.Project {
+		refreshed, err := discovery.DiscoverAll(mgr)
+		if err != nil {
+			return projects
+		}
+		return refreshed
+	})
 	prog := tea.NewProgram(model)
 
 	if _, err := prog.Run(); err != nil {
@@ -527,9 +517,8 @@ func handleAdd(dirPath string) error {
 		return fmt.Errorf("dossier introuvable: %s", absPath)
 	}
 
-	composePath := filepath.Join(absPath, "docker-compose.yml")
-	if _, err := os.Stat(composePath); os.IsNotExist(err) {
-		return fmt.Errorf("docker-compose.yml non trouvé dans %s", absPath)
+	if docker.FindComposeFile(absPath) == "" {
+		return fmt.Errorf("aucun fichier compose (docker-compose.yml, compose.yaml, ...) dans %s", absPath)
 	}
 
 	// Dérive le nom depuis le dossier (retire le préfixe "docker-" si présent)
@@ -567,11 +556,12 @@ func handleList() error {
 	fmt.Println("\n📋 Projets enregistrés dans ~/.docker-manager/projects.yml")
 	fmt.Println("─────────────────────────────────────────")
 
-	if cfg.Root != "" {
-		fmt.Printf("  📂 auto-discover root : %s\n", cfg.Root)
+	roots := discovery.EffectiveRoots()
+	if len(roots) == 0 {
+		fmt.Println("  📂 aucune racine de scan existante sur cette machine")
 	}
-	for _, r := range cfg.Roots {
-		fmt.Printf("  📂 auto-discover root : %s\n", r)
+	for _, r := range roots {
+		fmt.Printf("  📂 racine scannée : %s\n", r)
 	}
 
 	if len(cfg.Projects) == 0 {
@@ -580,8 +570,8 @@ func handleList() error {
 	} else {
 		for name, p := range cfg.Projects {
 			warn := ""
-			if _, err := os.Stat(filepath.Join(p.Path, "docker-compose.yml")); os.IsNotExist(err) {
-				warn = " ⚠️  (docker-compose.yml introuvable)"
+			if docker.FindComposeFile(p.Path) == "" {
+				warn = " ⚠️  (aucun fichier compose trouvé)"
 			}
 			fmt.Printf("  ▶ %-20s → %s%s\n", name, p.Path, warn)
 		}
